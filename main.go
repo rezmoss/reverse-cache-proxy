@@ -2,26 +2,30 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 // CacheEntry represents a cached HTTP response
 type CacheEntry struct {
-	Response    []byte
-	ContentType string
-	StatusCode  int
-	Timestamp   time.Time
-	Expiry      time.Time
+	Response     []byte
+	Headers      http.Header
+	StatusCode   int
+	Timestamp    time.Time
+	Expiry       time.Time
+	Uncompressed bool
 }
 
 // Cache is a simple in-memory cache for HTTP responses
@@ -164,23 +168,35 @@ func (c *Cache) GetStats() map[string]interface{} {
 
 // ReverseProxy represents our reverse proxy with caching capabilities
 type ReverseProxy struct {
-	target           *url.URL
-	proxy            *httputil.ReverseProxy
-	cache            *Cache
-	cacheTTL         time.Duration
-	cacheableStatus  map[int]bool
-	maxCacheSize     int64
-	currentCacheSize int64
+	target             *url.URL
+	proxy              *httputil.ReverseProxy
+	cache              *Cache
+	cacheTTL           time.Duration
+	cacheableStatus    map[int]bool
+	maxCacheSize       int64
+	currentCacheSize   int64
+	disableCompression bool
 }
 
 // NewReverseProxy creates a new reverse proxy with caching
-func NewReverseProxy(targetURL string, cacheTTL time.Duration, maxCacheSize int64) (*ReverseProxy, error) {
+func NewReverseProxy(targetURL string, cacheTTL time.Duration, maxCacheSize int64, disableCompression bool) (*ReverseProxy, error) {
 	url, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(url)
+
+	// Customize the director to handle compression
+	originalDirector := proxy.Director
+	proxy.Director = func(r *http.Request) {
+		originalDirector(r)
+
+		if disableCompression {
+			// Request uncompressed content from the backend if we want to cache uncompressed
+			r.Header.Del("Accept-Encoding")
+		}
+	}
 
 	// Initialize cacheable status codes (200, 301, 302, etc.)
 	cacheableStatus := map[int]bool{
@@ -191,13 +207,14 @@ func NewReverseProxy(targetURL string, cacheTTL time.Duration, maxCacheSize int6
 	}
 
 	return &ReverseProxy{
-		target:           url,
-		proxy:            proxy,
-		cache:            NewCache(),
-		cacheTTL:         cacheTTL,
-		cacheableStatus:  cacheableStatus,
-		maxCacheSize:     maxCacheSize,
-		currentCacheSize: 0,
+		target:             url,
+		proxy:              proxy,
+		cache:              NewCache(),
+		cacheTTL:           cacheTTL,
+		cacheableStatus:    cacheableStatus,
+		maxCacheSize:       maxCacheSize,
+		currentCacheSize:   0,
+		disableCompression: disableCompression,
 	}, nil
 }
 
@@ -207,11 +224,6 @@ func generateCacheKey(r *http.Request) string {
 	key := r.Method + r.URL.String()
 
 	// Add relevant headers that might affect response content
-	// For example, Accept-Encoding, Accept-Language
-	if acceptEncoding := r.Header.Get("Accept-Encoding"); acceptEncoding != "" {
-		key += "Accept-Encoding:" + acceptEncoding
-	}
-
 	if acceptLanguage := r.Header.Get("Accept-Language"); acceptLanguage != "" {
 		key += "Accept-Language:" + acceptLanguage
 	}
@@ -220,6 +232,15 @@ func generateCacheKey(r *http.Request) string {
 	hasher := md5.New()
 	hasher.Write([]byte(key))
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// copyHeader copies HTTP headers from source to destination
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
 }
 
 // ServeHTTP handles HTTP requests
@@ -243,7 +264,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate cache key
+	// Generate cache key - we don't include Accept-Encoding since we standardize compression
 	key := generateCacheKey(r)
 
 	// Check if response is in cache
@@ -251,15 +272,85 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Serve from cache
 		log.Printf("Cache hit: %s %s", r.Method, r.URL.Path)
 
-		// Set response headers
-		w.Header().Set("Content-Type", entry.ContentType)
-		w.Header().Set("X-Cache", "HIT")
-		w.Header().Set("X-Cache-Age", time.Since(entry.Timestamp).String())
-		w.Header().Set("X-Cache-Expires", time.Until(entry.Expiry).String())
+		// Determine if we should compress the response
+		acceptEncoding := r.Header.Get("Accept-Encoding")
+		supportsGzip := strings.Contains(acceptEncoding, "gzip")
+
+		// Copy cached headers to response
+		responseHeader := w.Header()
+		copyHeader(responseHeader, entry.Headers)
+
+		// Set cache headers
+		responseHeader.Set("X-Cache", "HIT")
+		responseHeader.Set("X-Cache-Age", time.Since(entry.Timestamp).String())
+		responseHeader.Set("X-Cache-Expires", time.Until(entry.Expiry).String())
+
+		var responseBody []byte
+
+		// If the cache entry is uncompressed and the client accepts gzip, compress it
+		if entry.Uncompressed && supportsGzip {
+			responseHeader.Set("Content-Encoding", "gzip")
+
+			// Create a buffer to hold the compressed data
+			var gzippedBody bytes.Buffer
+			gzipWriter := gzip.NewWriter(&gzippedBody)
+
+			// Compress the data
+			_, err := gzipWriter.Write(entry.Response)
+			if err != nil {
+				log.Printf("Error compressing response: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			// Close the gzip writer to flush any buffered data
+			if err := gzipWriter.Close(); err != nil {
+				log.Printf("Error closing gzip writer: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			responseBody = gzippedBody.Bytes()
+		} else if !entry.Uncompressed && !supportsGzip {
+			// If the cache entry is compressed and client doesn't support compression,
+			// we should decompress it (but this is a rare case since we usually cache uncompressed)
+			log.Printf("Client doesn't support gzip but cache entry is compressed - decompressing")
+
+			// Create a reader for the gzipped data
+			gzipReader, err := gzip.NewReader(bytes.NewReader(entry.Response))
+			if err != nil {
+				log.Printf("Error creating gzip reader: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			// Read the decompressed data
+			decompressed, err := io.ReadAll(gzipReader)
+			if err != nil {
+				log.Printf("Error decompressing response: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			// Close the reader
+			if err := gzipReader.Close(); err != nil {
+				log.Printf("Error closing gzip reader: %v", err)
+			}
+
+			// Remove the Content-Encoding header
+			responseHeader.Del("Content-Encoding")
+			responseBody = decompressed
+		} else {
+			// Use the cached response as-is (already in the right format)
+			responseBody = entry.Response
+		}
+
+		// Update content length if it changed
+		responseHeader.Set("Content-Length", fmt.Sprintf("%d", len(responseBody)))
 
 		// Set status code and write response
 		w.WriteHeader(entry.StatusCode)
-		w.Write(entry.Response)
+		w.Write(responseBody)
 		return
 	}
 
@@ -267,32 +358,66 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Create a custom response writer to capture the response
 	responseBuffer := &bytes.Buffer{}
-	responseWriter := &ResponseCapturer{
+	capturer := &ResponseCapturer{
 		ResponseWriter: w,
 		Buffer:         responseBuffer,
+		headers:        make(http.Header),
 	}
 
 	// Serve the request with our capturing writer
-	p.proxy.ServeHTTP(responseWriter, r)
+	p.proxy.ServeHTTP(capturer, r)
 
 	// Check if we should cache this response
-	isCacheable := p.cacheableStatus[responseWriter.StatusCode]
+	isCacheable := p.cacheableStatus[capturer.StatusCode]
 
 	// Don't cache if the response says not to
-	if cacheControl := responseWriter.Header().Get("Cache-Control"); cacheControl != "" {
-		if cacheControl == "no-store" || cacheControl == "no-cache" {
+	if cacheControl := capturer.headers.Get("Cache-Control"); cacheControl != "" {
+		if strings.Contains(cacheControl, "no-store") || strings.Contains(cacheControl, "no-cache") {
 			isCacheable = false
 		}
 	}
 
 	// If status is cacheable, store in cache
 	if isCacheable {
+		responseData := capturer.Buffer.Bytes()
+		isCompressed := capturer.headers.Get("Content-Encoding") == "gzip"
+
+		// If the response is compressed and we want to cache uncompressed, decompress it
+		if isCompressed && p.disableCompression {
+			// Create a reader for the gzipped data
+			gzipReader, err := gzip.NewReader(bytes.NewReader(responseData))
+			if err != nil {
+				log.Printf("Error creating gzip reader: %v", err)
+			} else {
+				// Read the decompressed data
+				decompressed, err := io.ReadAll(gzipReader)
+				if err != nil {
+					log.Printf("Error decompressing response: %v", err)
+				} else {
+					// Close the reader
+					if err := gzipReader.Close(); err != nil {
+						log.Printf("Error closing gzip reader: %v", err)
+					}
+
+					// Use the decompressed data for caching
+					responseData = decompressed
+
+					// Remove the Content-Encoding header for the cached version
+					capturer.headers.Del("Content-Encoding")
+
+					// Update Content-Length
+					capturer.headers.Set("Content-Length", fmt.Sprintf("%d", len(responseData)))
+				}
+			}
+		}
+
 		p.cache.Set(key, CacheEntry{
-			Response:    responseBuffer.Bytes(),
-			ContentType: responseWriter.Header().Get("Content-Type"),
-			StatusCode:  responseWriter.StatusCode,
-			Timestamp:   time.Now(),
-			Expiry:      time.Now().Add(p.cacheTTL),
+			Response:     responseData,
+			Headers:      capturer.headers.Clone(),
+			StatusCode:   capturer.StatusCode,
+			Timestamp:    time.Now(),
+			Expiry:       time.Now().Add(p.cacheTTL),
+			Uncompressed: p.disableCompression || !isCompressed,
 		}, p)
 
 		// Set cache header
@@ -306,6 +431,7 @@ func (p *ReverseProxy) handleCacheStats(w http.ResponseWriter, r *http.Request) 
 	stats["current_size_bytes"] = p.currentCacheSize
 	stats["max_size_bytes"] = p.maxCacheSize
 	stats["ttl_seconds"] = p.cacheTTL.Seconds()
+	stats["compression_disabled"] = p.disableCompression
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{
@@ -313,28 +439,46 @@ func (p *ReverseProxy) handleCacheStats(w http.ResponseWriter, r *http.Request) 
   "expired": %d,
   "current_size_bytes": %d,
   "max_size_bytes": %d,
-  "ttl_seconds": %.2f
-}`, stats["entries"], stats["expired"], stats["current_size_bytes"], stats["max_size_bytes"], stats["ttl_seconds"])
+  "ttl_seconds": %.2f,
+  "compression_disabled": %t
+}`, stats["entries"], stats["expired"], stats["current_size_bytes"], stats["max_size_bytes"], stats["ttl_seconds"], stats["compression_disabled"])
 }
 
 // ResponseCapturer captures response data for caching
 type ResponseCapturer struct {
 	http.ResponseWriter
-	Buffer     *bytes.Buffer
-	StatusCode int
+	Buffer      *bytes.Buffer
+	StatusCode  int
+	headers     http.Header
+	headersSent bool
 }
 
 // WriteHeader captures status code before writing it
 func (r *ResponseCapturer) WriteHeader(statusCode int) {
 	r.StatusCode = statusCode
+
+	// Copy the headers to the real response writer
+	copyHeader(r.ResponseWriter.Header(), r.headers)
+
 	r.ResponseWriter.WriteHeader(statusCode)
+	r.headersSent = true
 }
 
 // Write captures response data before writing it
 func (r *ResponseCapturer) Write(b []byte) (int, error) {
+	// If headers haven't been sent yet, send them with the default status code
+	if !r.headersSent {
+		r.WriteHeader(http.StatusOK)
+	}
+
 	// Write to both the original writer and our buffer
 	r.Buffer.Write(b)
 	return r.ResponseWriter.Write(b)
+}
+
+// Header returns the header map for this response
+func (r *ResponseCapturer) Header() http.Header {
+	return r.headers
 }
 
 func main() {
@@ -343,10 +487,11 @@ func main() {
 	target := flag.String("target", "http://example.com", "Target URL to proxy")
 	cacheTTL := flag.Duration("cache-ttl", 5*time.Minute, "Cache TTL (e.g., 5m, 1h)")
 	maxCacheSize := flag.Int64("max-cache-size", 100*1024*1024, "Maximum cache size in bytes (default 100MB)")
+	disableCompression := flag.Bool("disable-compression", true, "Disable compression in cached responses (recommended)")
 	flag.Parse()
 
 	// Create the reverse proxy
-	proxy, err := NewReverseProxy(*target, *cacheTTL, *maxCacheSize)
+	proxy, err := NewReverseProxy(*target, *cacheTTL, *maxCacheSize, *disableCompression)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -373,7 +518,8 @@ func main() {
 	}
 
 	log.Printf("Reverse proxy started at :%d -> %s", *port, *target)
-	log.Printf("Cache TTL: %s, Max cache size: %d MB", *cacheTTL, *maxCacheSize/1024/1024)
+	log.Printf("Cache TTL: %s, Max cache size: %d MB, Compression disabled: %t",
+		*cacheTTL, *maxCacheSize/1024/1024, *disableCompression)
 	log.Printf("Cache stats available at http://localhost:%d/_cache/stats", *port)
 
 	if err := server.ListenAndServe(); err != nil {
